@@ -1,11 +1,34 @@
 import asyncio
 import json
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup as bs
 from fake_useragent import UserAgent
 
+# logging setup
+LOG_FILE = 'olx-scraper.log'
+handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=10*1024*1024,
+    backupCount=5,
+    encoding='utf-8'
+)
+logger = logging.getLogger("olx-log")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+formatter = logging.Formatter(
+    fmt = "[{levelname} {name} {asctime}] {message}",
+    style="{"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+handler_cout = logging.StreamHandler()
+handler_cout.setFormatter(formatter)
+logger.addHandler(handler_cout)
+# parser setup
 LAST_ID = "last_id.txt"
 def get_last_id():
     if os.path.exists(LAST_ID):
@@ -16,6 +39,12 @@ def get_last_id():
 def save_last_id(rec_id):
     with open(LAST_ID, 'w') as f:
         f.write(str(rec_id))
+
+def is_promoted(i):
+    link_el = i.find('a')
+    href = link_el.get('href', '') if link_el else ""
+    is_promoted = 'promoted' in href
+    return is_promoted
 
 async def main():
     async with async_playwright() as p:
@@ -30,30 +59,35 @@ async def main():
         new_top_id = None
         last_processed_id = get_last_id()
         results = []
-        print(f"Start scraping on: {ua[:30]}...")
+        logger.info(f"Start scraping on: {ua[:30]}...")
         try:
             stop_scraping = False
             page_num = 1
+            set_ids = set()
             while not stop_scraping:
                 url = f'https://www.olx.ua/uk/nedvizhimost/kvartiry/dolgosrochnaya-arenda-kvartir/kiev/?currency=UAH&page={page_num}&search%5Border%5D=created_at:desc'
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_selector('div[data-testid="listing-grid"]', timeout=15000)
-                print("Scrolling page...")
                 await page.get_by_test_id('pagination-wrapper').scroll_into_view_if_needed()
+                logger.info("Scrolling page...")
 
                 html = await page.content()
                 soup = bs(html, "html.parser")
                 items = soup.find_all("div", attrs={"data-testid": "l-card"})
                 if not items: 
                     break
-                if page_num == 1 and items:
-                    new_top_id = items[0].get('id')
-                print(f"Page {page_num}, found {len(items)}")
+                logger.info(f"Page {page_num}, found {len(items)}")
                 time_collected = datetime.now().isoformat()
                 for i in items:
                     curr_id = i.get('id')
-                    if curr_id == last_processed_id:
-                        print("Found all new records")
+                    if curr_id in set_ids:
+                        continue
+                    promoted = is_promoted(i)
+                    if page_num == 1 and not promoted and new_top_id is None:
+                        new_top_id = curr_id
+                        logger.info(f"The latest id {new_top_id} is written to last_id.txt")
+                    if curr_id == last_processed_id and not promoted:
+                        logger.info("Found all new records")
                         stop_scraping = True
                         break
 
@@ -63,6 +97,7 @@ async def main():
                     loc_el = i.find(attrs={"data-testid": "location-date"})
                     size_el = i.find("span", attrs={"data-nx-name": "P5"})
                     if h4_el and price_el:
+                        set_ids.add(curr_id)
                         record = {
                             "id": curr_id,
                             "title": h4_el.get_text(strip=True),
@@ -75,7 +110,7 @@ async def main():
                         }
                         results.append(record)
                 if not soup.find('a', attrs={'data-testid': 'pagination-forward'}):
-                    print(f"Reached last page: {page_num}")
+                    logger.info(f"Reached last page: {page_num}")
                     break
                 page_num += 1
 
@@ -83,17 +118,17 @@ async def main():
                 filename = f"olx_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
                 with open(filename, 'w', encoding='utf-8') as f:
                     json.dump(results, f, ensure_ascii=False, indent=4)
-                print(f"{len(results)} new records saved to: {filename}")
+                logger.info(f"{len(results)} new records saved to: {filename}")
                 if new_top_id:
                     save_last_id(new_top_id)
             else:
-                print("No new records found")
+                logger.warning("No new records found")
         except Exception as e:
-            print(f"Error occured during scraping: {e}")
+            logger.error(f"Error occured during scraping: {e}", exc_info=True)
             await page.screenshot(path="error_debug.png")
         finally:
             await browser.close()
-            print("Scraping finished")
+            logger.info("Scraping finished")
 
 if __name__ == "__main__":
     asyncio.run(main())
