@@ -1,50 +1,71 @@
 import asyncio
 import json
 import os
+import io
 import logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup as bs
 from fake_useragent import UserAgent
+from databricks.sdk import WorkspaceClient
+from dotenv import load_dotenv
 
+load_dotenv()
 # logging setup
 LOG_FILE = 'olx-scraper.log'
-handler = RotatingFileHandler(
-    LOG_FILE,
-    maxBytes=10*1024*1024,
-    backupCount=5,
-    encoding='utf-8'
-)
 logger = logging.getLogger("olx-log")
 logger.setLevel(logging.INFO)
-logger.propagate = False
 formatter = logging.Formatter(
     fmt = "[{levelname} {name} {asctime}] {message}",
     style="{"
 )
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 handler_cout = logging.StreamHandler()
 handler_cout.setFormatter(formatter)
 logger.addHandler(handler_cout)
+
 # parser setup
 LAST_ID = "last_id.txt"
+URL_HOST = os.getenv("URL_HOST")
+TOKEN = os.getenv("TOKEN")
+DATABRICKS_PATH = "/Volumes/workspace/default/olx_flats_data"
+
+w = WorkspaceClient(host=URL_HOST,token=TOKEN)
+
 def get_last_id():
-    if os.path.exists(LAST_ID):
-        with open(LAST_ID, 'r') as f:
-            return f.read().strip()
-    return None
+    try:
+        with w.files.download(f"{DATABRICKS_PATH}/last_id.txt").contents as f:
+            last_id = f.read().decode('utf-8').strip()
+            logger.info(f"Last id {last_id} read from databricks")
+            return last_id
+    except Exception as e:
+        logger.warning(f"No last id file found: {e}")
+        return None
 
 def save_last_id(rec_id):
-    with open(LAST_ID, 'w') as f:
-        f.write(str(rec_id))
+    try:
+        data_stream = io.BytesIO(str(rec_id).encode('utf-8'))
+        w.files.upload(f"{DATABRICKS_PATH}/last_id.txt", data_stream, overwrite=True)
+        logger.info(f"New last_id downloaded to databricks: {rec_id}")
+    except Exception as e:
+        logger.error(f"Failed to save state to cloud: {e}")
 
 def is_promoted(i):
     link_el = i.find('a')
     href = link_el.get('href', '') if link_el else ""
     is_promoted = 'promoted' in href
     return is_promoted
+
+def upload_databricks(results):
+    try:
+        filename = f"olx_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+        remote_path = f"{DATABRICKS_PATH}/{filename}"
+        json_data = json.dumps(results, ensure_ascii=False, indent=4).encode('utf-8')
+        data_stream = io.BytesIO(json_data)
+        logger.info(f"Downloading {filename} into Databricks")
+        w.files.upload(remote_path, data_stream)
+        logger.info("Data downloaded to Databricks")
+    except Exception as e:
+        logger.error(f"Loading error: {e}")
 
 async def main():
     async with async_playwright() as p:
@@ -85,9 +106,9 @@ async def main():
                     promoted = is_promoted(i)
                     if page_num == 1 and not promoted and new_top_id is None:
                         new_top_id = curr_id
-                        logger.info(f"The latest id {new_top_id} is written to last_id.txt")
+                        save_last_id(new_top_id)
                     if curr_id == last_processed_id and not promoted:
-                        logger.info("Found all new records")
+                        logger.info("Last record was reached, stop scraping")
                         stop_scraping = True
                         break
 
@@ -115,17 +136,12 @@ async def main():
                 page_num += 1
 
             if results:
-                filename = f"olx_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, ensure_ascii=False, indent=4)
-                logger.info(f"{len(results)} new records saved to: {filename}")
-                if new_top_id:
-                    save_last_id(new_top_id)
+                upload_databricks(results)
+                logger.info(f"Found {len(results)} new records")
             else:
                 logger.warning("No new records found")
         except Exception as e:
             logger.error(f"Error occured during scraping: {e}", exc_info=True)
-            await page.screenshot(path="error_debug.png")
         finally:
             await browser.close()
             logger.info("Scraping finished")
